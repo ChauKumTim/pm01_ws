@@ -2,6 +2,11 @@
 
 #include <pcl/common/common.h>
 
+#include <sensor_msgs/point_cloud2_iterator.hpp>
+#include <sensor_msgs/msg/point_field.hpp>
+#include <algorithm>
+#include <cmath>
+
 #define RETURN0 0x00
 #define RETURN0AND1 0x10
 
@@ -475,85 +480,147 @@ void Preprocess::velodyne_handler(const sensor_msgs::msg::PointCloud2::UniquePtr
 
 void Preprocess::mid360_handler(const sensor_msgs::msg::PointCloud2::UniquePtr &msg)
 {
-  pl_surf.clear();
-  pl_corn.clear();
-  pl_full.clear();
+    // Clear any point clouds left from the previous scan.
+    pl_surf.clear();
+    pl_corn.clear();
+    pl_full.clear();
 
-  pcl::PointCloud<livox_ros::LivoxPointXyzrtl> pl_orig;
-  pcl::fromROSMsg(*msg, pl_orig);
-  int plsize = pl_orig.points.size();
-  if (plsize == 0)
-    return;
-  pl_surf.reserve(plsize);
-
-  /*** These variables only works when no point timestamps given ***/
-  double omega_l = 0.361 * SCAN_RATE;  // scan angular velocity
-  std::vector<bool> is_first(N_SCANS, true);
-  std::vector<double> yaw_fp(N_SCANS, 0.0);    // yaw of first scan point
-  std::vector<float> yaw_last(N_SCANS, 0.0);   // yaw of last scan point
-  std::vector<float> time_last(N_SCANS, 0.0);  // last offset time
-  /*****************************************************************/
-
-  given_offset_time = false;
-  double yaw_first = atan2(pl_orig.points[0].y, pl_orig.points[0].x) * 57.29578;
-  double yaw_end = yaw_first;
-  int layer_first = pl_orig.points[0].line;
-  for (uint i = plsize - 1; i > 0; i--)
-  {
-    if (pl_orig.points[i].line == layer_first)
+    // Ignore empty messages.
+    if (msg->width == 0 || msg->height == 0)
     {
-      yaw_end = atan2(pl_orig.points[i].y, pl_orig.points[i].x) * 57.29578;
-      break;
-    }
-  }
-
-  for (uint i = 0; i < plsize; ++i)
-  {
-    PointType added_pt;
-    added_pt.normal_x = 0;
-    added_pt.normal_y = 0;
-    added_pt.normal_z = 0;
-    added_pt.x = pl_orig.points[i].x;
-    added_pt.y = pl_orig.points[i].y;
-    added_pt.z = pl_orig.points[i].z;
-    added_pt.intensity = pl_orig.points[i].reflectivity;
-    added_pt.curvature = 0.;
-
-    int layer = pl_orig.points[i].line;
-    double yaw_angle = atan2(added_pt.y, added_pt.x) * 57.2957;
-
-    if (is_first[layer])
-    {
-      // printf("layer: %d; is first: %d", layer, is_first[layer]);
-      yaw_fp[layer] = yaw_angle;
-      is_first[layer] = false;
-      added_pt.curvature = 0.0;
-      yaw_last[layer] = yaw_angle;
-      time_last[layer] = added_pt.curvature;
-      continue;
+        return;
     }
 
-    // compute offset time
-    if (yaw_angle <= yaw_fp[layer])
+    // The adapter publishes:
+    //   reflectivity: FLOAT32
+    //   time:         FLOAT32 (milliseconds from scan start)
+    //
+    // Verify these fields exist before trying to read them.
+    bool has_time = false;
+    bool has_reflectivity = false;
+
+    for (const auto &field : msg->fields)
     {
-      added_pt.curvature = (yaw_fp[layer] - yaw_angle) / omega_l;
-    }
-    else
-    {
-      added_pt.curvature = (yaw_fp[layer] - yaw_angle + 360.0) / omega_l;
+        if (field.name == "time" &&
+            field.datatype ==
+                sensor_msgs::msg::PointField::FLOAT32)
+        {
+            has_time = true;
+        }
+
+        if (field.name == "reflectivity" &&
+            field.datatype ==
+                sensor_msgs::msg::PointField::FLOAT32)
+        {
+            has_reflectivity = true;
+        }
     }
 
-    if (added_pt.curvature < time_last[layer])
-      added_pt.curvature += 360.0 / omega_l;
-
-    yaw_last[layer] = yaw_angle;
-    time_last[layer] = added_pt.curvature;
-
-    if (added_pt.x * added_pt.x + added_pt.y * added_pt.y + added_pt.z * added_pt.z > (blind * blind))
+    if (!has_time || !has_reflectivity)
     {
-      pl_surf.push_back(std::move(added_pt));
+        RCLCPP_ERROR(
+            rclcpp::get_logger("fastlio_preprocess"),
+            "MID360 requires FLOAT32 time and reflectivity fields");
+
+        return;
     }
-  }
+
+    // Read the PointCloud2 fields directly.
+    //
+    // This avoids converting the cloud through the original
+    // Livox PCL point structure, which does not contain our
+    // new per-point time field.
+    sensor_msgs::PointCloud2ConstIterator<float> x(*msg, "x");
+    sensor_msgs::PointCloud2ConstIterator<float> y(*msg, "y");
+    sensor_msgs::PointCloud2ConstIterator<float> z(*msg, "z");
+
+    sensor_msgs::PointCloud2ConstIterator<float> reflectivity(
+        *msg, "reflectivity");
+
+    sensor_msgs::PointCloud2ConstIterator<float> time(
+        *msg, "time");
+
+    const size_t total_points =
+        static_cast<size_t>(msg->width) * msg->height;
+
+    pl_surf.reserve(total_points);
+
+    // Actual per-point offsets are supplied by the adapter.
+    // No angular timestamp estimation is necessary.
+    given_offset_time = true;
+
+    const int filter_step = std::max(1, point_filter_num);
+
+    for (size_t i = 0; i < total_points; ++i)
+    {
+        // Read the current point.
+        const float px = *x;
+        const float py = *y;
+        const float pz = *z;
+
+        const float intensity = *reflectivity;
+        const float offset_ms = *time;
+
+        // Always advance every iterator, even when the point
+        // will be filtered out.
+        ++x;
+        ++y;
+        ++z;
+        ++reflectivity;
+        ++time;
+
+        // Apply the existing point downsampling setting.
+        if (i % filter_step != 0)
+        {
+            continue;
+        }
+
+        // Reject invalid coordinates and timestamps.
+        if (!std::isfinite(px) ||
+            !std::isfinite(py) ||
+            !std::isfinite(pz) ||
+            !std::isfinite(intensity) ||
+            !std::isfinite(offset_ms))
+        {
+            continue;
+        }
+
+        // Adapter scans cover 100 ms.
+        if (offset_ms < 0.0f || offset_ms >= 100.0f)
+        {
+            continue;
+        }
+
+        // Apply the original blind-distance filter.
+        if (px * px + py * py + pz * pz <= blind * blind)
+        {
+            continue;
+        }
+
+        // Convert the PointCloud2 point into FAST-LIO's
+        // internal PCL point format.
+        PointType point;
+
+        point.x = px;
+        point.y = py;
+        point.z = pz;
+
+        point.intensity = intensity;
+
+        point.normal_x = 0.0f;
+        point.normal_y = 0.0f;
+        point.normal_z = 0.0f;
+
+        // IMPORTANT:
+        // FAST-LIO uses curvature to store the point's
+        // acquisition-time offset in milliseconds.
+        //
+        // This is the actual timing from the PM01 LiDAR,
+        // rather than a value estimated from scan angles.
+        point.curvature = offset_ms;
+
+        pl_surf.push_back(point);
+    }
 }
 
 void Preprocess::default_handler(const sensor_msgs::msg::PointCloud2::UniquePtr &msg)

@@ -17,6 +17,7 @@ enum LID_TYPE
   VELO16,
   OUST64,
   MID360
+  // PM01 = 5
 };  //{1, 2, 3}
 enum TIME_UNIT
 {
