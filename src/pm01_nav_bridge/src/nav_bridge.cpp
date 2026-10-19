@@ -36,7 +36,7 @@ public:
 
     nav_odom_pub_ =
       this->create_publisher<nav_msgs::msg::Odometry>(
-        "/pm01/nav_odom", 10);
+        "/odom", 10);
 
     fastlio_sub_ =
       this->create_subscription<nav_msgs::msg::Odometry>(

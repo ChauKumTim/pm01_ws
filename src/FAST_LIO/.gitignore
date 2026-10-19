@@ -1,17 +1,8 @@
-# ROS 2 / colcon build outputs
-build/
-install/
-log/
-
-# Python
-__pycache__/
-*.py[cod]
-.pytest_cache/
-
-# IDE and OS files
-.vscode/
-.idea/
-.DS_Store
-
-/src.zip
-/src/third_party/engineai_robotics_third_party_src.tar.xz
+build
+Log/*.png
+Log/*.txt
+Log/*.csv
+Log/*.pdf
+.vscode/c_cpp_properties.json
+.vscode/settings.json
+PCD/*.pcd

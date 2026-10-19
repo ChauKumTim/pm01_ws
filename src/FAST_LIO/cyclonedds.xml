@@ -1,9 +1,0 @@
-<CycloneDDS>
-  <Domain>
-    <General>
-      <Interfaces>
-        <NetworkInterface name="enp63s0" />
-      </Interfaces>
-    </General>
-  </Domain>
-</CycloneDDS>
